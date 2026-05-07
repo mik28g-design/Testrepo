@@ -1,0 +1,1960 @@
+
+C# WordTableParser Refactoring
+Loading...
+      
+ 
+ 
+ 
+wow, fast perfekt, hab noch eine anforderung vergessen: in der weiteren tabelle wo die gefundenen marker nachgetragen werden aber der pipe-strich nicht wiederholt wird, soll trotzdem die tabellenspalte konstruiert weerden, auch wenn in der spalte nie etwas eingetragen wird, denn sonst sehen die tabellen nicht gleich aus. verstehst du? schau auf das angehängte bild 
+ 
+  
+  
+profile
+GLM-5.1
+   
+ 
+ 
+
+        Analyze the User's Request:
+             
+
+            Context: The user is building a Word document generator/parsers using C# and Word Interop. They have a WordTableParser that parses text lines into a 3D string array (row, col, text/flag) based on specific markers ("vorgelegt als", "Anlage", Regex for IDs, and "|"). 
+             
+
+            Feature implemented so far: History extraction. If a row's main text matches a previous table's row, the other markers are inherited. The pipe ("|") is not inherited (suppressed) if it was already present in the history. 
+             
+
+            New Requirement: Even if the pipe is suppressed (not written to the result array's text/flag), the column for the pipe must still exist in the new table so that the tables visually align and look the same. Currently, if the pipe is suppressed, the column might be missing or empty in a way that makes the table structure differ. 
+             
+
+            Wait, let me re-read carefully: "soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird, denn sonst sehen die tabellen nicht gleich aus." 
+             
+
+            Let's look at the current WordTableParser code (Phase 1b: Historien-Analyse). 
+            csharp
+             
+              
+             
+            if (history != null)
+            {
+                foreach (var line in arrTextLines)
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    foreach (var histKey in history.Keys)
+                    {
+                        if (line.IndexOf(histKey, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            foreach (var histMarkerPattern in history[histKey].Keys)
+                            {
+                                if (!activeMarkers.Any(am => am.SearchPattern == histMarkerPattern))
+                                {
+                                    var def = markerDefinitions.First(m => m.SearchPattern == histMarkerPattern);
+                                    def.TargetColumnIndex = nextColIndex++;
+                                    activeMarkers.Add(def);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+             
+             
+             
+             
+
+            Wait, Phase 1b already ensures that all markers from the history are added to activeMarkers if the main text matches. This means the column is created in the resulting 3D array. 
+             
+
+            Let's look at Phase 2 (History-Logic): 
+            csharp
+             
+              
+             
+            if (matchedHistoryKey != null)
+            {
+                var histEntry = history[matchedHistoryKey];
+                foreach (var kvp in histEntry)
+                {
+                    string pattern = kvp.Key;
+                    string histText = kvp.Value.Text;
+                    string histFlag = kvp.Value.Flag;
+
+                    var activeMarker = activeMarkers.FirstOrDefault(m => m.SearchPattern == pattern);
+                    if (activeMarker != null)
+                    {
+                        int colIdx = activeMarker.TargetColumnIndex;
+                        if (pattern == "|")
+                        {
+                            if (histFlag == "r") // Wenn in der Historie bereits ein Pipe-Strich war -> lösche den neuen
+                            {
+                                resultArray[rowIdx, colIdx, 0] = string.Empty;
+                                resultArray[rowIdx, colIdx, 1] = string.Empty;
+                            }
+                            // If histFlag != "r", it keeps the current parsed pipe.
+                        }
+                        else
+                        {
+                            if (string.IsNullOrEmpty(resultArray[rowIdx, colIdx, 0]))
+                            {
+                                resultArray[rowIdx, colIdx, 0] = histText;
+                                resultArray[rowIdx, colIdx, 1] = histFlag;
+                            }
+                        }
+                    }
+                }
+            }
+             
+             
+             
+             
+
+            If the history contains the pipe, Phase 1b adds the pipe to activeMarkers (thus creating the column). Then Phase 2 sets the cell to string.Empty. 
+             
+
+            But what if the current text being parsed has NO pipe, and the history HAS a pipe, BUT the current text doesn't even match any history key?
+            Wait, if it matches a history key, the pipe column is created.
+            What if the current table has a row that doesn't match the history, but another row in the current table matches the history and therefore introduces the Pipe column? Since the array size is validRowCount, totalColumns, all rows get the same number of columns. So column alignment is fine. 
+             
+
+            Let's look at the picture the user provided.
+            Table 1:
+            Row 1: Vertrag vom 18.04.2013 | vorgelegt als: | Anlage: | K123 |
+            Row 2: Urteil | vorgelegt als: | Anlage: | AG45 |
+            Table 2 (Current output in picture - looks like the pipe column is completely missing for row 2? Or the columns are shifted?):
+            Ah! The user says: "in der weiteren tabelle wo die gefundenen marker nachgetragen werden aber der pipe-strich nicht wiederholt wird, soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird"
+            Let's trace a scenario:
+            Tabelle 1 hat: "Urteil vorgelegt als: Anlage: AG45 |" -> Parser creates columns: 0:Haupttext, 1:vorgelegt als, 2:Anlage, 3:AG45, 4:|
+            Tabelle 2 text: "Urteil" -> Parser analyzes. Phase 1a finds no markers. Phase 1b sees "Urteil" is in history. History has keys: "vorgelegt als", "Anlage", @"\b(K|B|AS|AG)\d+(?::|\b)", "|".
+            Phase 1b adds them all to activeMarkers. So totalColumns = 6 (0 + 5 markers).
+            Phase 2 parses "Urteil". No markers found in text. resultArray[rowIdx, 0, 0] = "Urteil".
+            History logic kicks in: fills "vorgelegt als:", "Anlage:", "AG45". For "|", histFlag is "r", so it sets resultArray[rowIdx, 4, 0] = string.Empty, resultArray[rowIdx, 4, 1] = string.Empty.
+            Wait, this should exactly produce an empty column!
+            Why does the user say it's not working or the column is missing?
+            Let's check WordTableHistoryExtractor. 
+            csharp
+             
+              
+             
+            // PIPE-ERKENNUNG (Über Rechtsbündigkeit)
+            try
+            {
+                if (cellText.Contains("|") && table.Cell(r, c).Range.ParagraphFormat.Alignment == Word.WdParagraphAlignment.wdAlignParagraphRight)
+                {
+                    rowHistory["|"] = ("|", "r");
+                    hasData = true;
+                    continue;
+                }
+            }
+             
+             
+             
+
+            If the pipe is in the history, the history entry has "|" mapped to ("|", "r").
+            When Phase 1b processes this history entry: 
+            csharp
+             
+              
+             
+            foreach (var histMarkerPattern in history[histKey].Keys) // histMarkerPattern is "|"
+            {
+                if (!activeMarkers.Any(am => am.SearchPattern == histMarkerPattern)) // Does activeMarkers have "|"?
+                {
+                    var def = markerDefinitions.First(m => m.SearchPattern == histMarkerPattern); // Gets "|" def
+                    def.TargetColumnIndex = nextColIndex++;
+                    activeMarkers.Add(def);
+                }
+            }
+             
+             
+             
+
+            This should add the "|" column to activeMarkers for Table 2, meaning totalColumns will include the pipe column.
+            Is it possible that the Pipe column is not added because the current text already has a Pipe, but for a different row?
+            Wait, if Table 2 has: "Vertrag... |" AND "Urteil" (no pipe).
+            Phase 1a finds "|" in "Vertrag..." -> adds "|" to activeMarkers.
+            Phase 2 processes "Urteil", history fills the other columns, suppresses the pipe -> empty column.
+            This seems correct. 
+
+            Let's re-read the image description or infer the problem from the user's words.
+            "in der weiteren tabelle wo die gefundenen marker nachgetragen werden aber der pipe-strich nicht wiederholt wird, soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird"
+            What if the pipe column was not recognized properly in the history extraction?
+            Or what if the table generation in Word simply doesn't create the column if the array's column is empty?
+            The user creates the Word table dynamically:
+            wordtabB = sel.Tables.Add(sel.Range, 1, gdrstg.GetLength(1) + 1, ...)
+            So gdrstg.GetLength(1) determines the number of columns. If the 3D array has the pipe column, the Word table will have the column. So the problem must be in the 3D array generation. 
+
+            Let's think of a case where the 3D array lacks the pipe column in Table 2.
+            Table 2 input text:
+            "Urteil"
+            Phase 1a: Scans "Urteil". Finds NO markers. nextColIndex = 1.
+            Phase 1b: Scans history. "Urteil" is in history. History keys: "vorgelegt als", "Anlage", Regex, "|".
+            Wait! Phase 1b checks if (line.IndexOf(histKey, StringComparison.OrdinalIgnoreCase) >= 0)
+            If histKey is "Urteil", it matches.
+            Then it loops histMarkerPattern in history["Urteil"].Keys.
+            It adds "vorgelegt als" (col 1), "Anlage" (col 2), Regex (col 3), "|" (col 4).
+            So totalColumns = 5 (0 to 4).
+            This should work perfectly. The column is constructed in the array. 
+
+            Is there a bug in Phase 1b?
+            var def = markerDefinitions.First(m => m.SearchPattern == histMarkerPattern);
+            If histMarkerPattern is @"\b(K|B|AS|AG)\d+(?::|\b)", does markerDefinitions.First(m => m.SearchPattern == histMarkerPattern) find it?
+            Yes, markerDefinitions contains it exactly as @"\b(K|B|AS|AG)\d+(?::|\b)". 
+
+            What if the history dictionary is constructed slightly differently?
+            In WordTableHistoryExtractor, if a cell has "K123", the regex matches.
+            pattern = @"\b(K|B|AS|AG)\d+(?::|\b)";
+            rowHistory[pattern] = (cellText, string.Empty);
+            This matches. 
+
+            Let's look at the picture again. "Beweis: Vertrag vom 18.04.2013 ... vorgelegt als Anlage K123 |" (Wait, the picture shows "K123" in the last column before the pipe? No, the table has columns:
+            1: Beweis:
+            2: Vertrag vom 18.04.2013 / hier neue zeile...
+            3: vorgelegt als:
+            4: Anlage:
+            5: K123
+            6: |
+            Table 2 in the picture:
+            1: Beweis:
+            2: Vertrag vom 18.04.2013 \vhier neue zeile \vnoch eine neue zeile vorgelegt als Anlage K123
+            Wait, the pipe is missing from the second row in the picture!
+            Ah, in the picture, the second table doesn't have the pipe column at all, or the pipe is not there.
+            The user says: "soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird, denn sonst sehen die tabellen nicht gleich aus." 
+
+            Could the issue be that the Word generation code skips empty columns?
+            wordtabB = sel.Tables.Add(sel.Range, 1, gdrstg.GetLength(1) + 1, ...)
+            If the user iterates over the columns to insert text, and the last column is completely empty for all rows in Table 2, maybe they don't generate the column?
+            No, GetLength(1) is fixed for the whole array. If one row has the pipe column, all rows have it. But what if no row in Table 2 triggers the pipe column?
+            Wait. If NO row in Table 2 originally contains a pipe, and ONLY ONE row matches a history entry that contains a pipe.
+            Phase 1a: finds NO pipes in the current text. activeMarkers has NO pipe.
+            Phase 1b: iterates through arrTextLines.
+            Let's say arrTextLines = ["Urteil", "Noch ein Text"].
+            "Urteil" is in history.
+            Phase 1b finds "Urteil" matches histKey.
+            It iterates histMarkerPattern in history["Urteil"].Keys.
+            One of the patterns is "|".
+            It adds "|" to activeMarkers. So totalColumns includes the pipe column.
+            So the array will have the pipe column.
+            Why would it be missing? 
+
+            Let's look at ExtractHistoryFromDocument.
+            What if the pipe column in the Word table is the VERY LAST column?
+            And what if it's completely empty in some rows?
+            When writing the array to Word, if the user checks if (!string.IsNullOrEmpty(gdrstg[r, c, 0])) before writing to a cell, they might skip setting borders or something, making it look like the column isn't there? No, the user explicitly creates columns based on gdrstg.GetLength(1) + 1. 
+
+            Wait, let's re-read the user's problem description carefully:
+            "in der weiteren tabelle wo die gefundenen marker nachgetragen werden aber der pipe-strich nicht wiederholt wird, soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird, denn sonst sehen die tabellen nicht gleich aus." 
+
+            Is it possible that the history logic currently removes the pipe from the history, or fails to add the pipe marker to activeMarkers?
+            Let's trace carefully:
+            Table 2 has text: "Urteil" (no markers in text).
+            Phase 1a: markerFoundInAnyLine is false for all markers. activeMarkers is empty. nextColIndex = 1.
+            Phase 1b: 
+            csharp
+             
+              
+             
+            foreach (var line in arrTextLines) // line is "Urteil"
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                foreach (var histKey in history.Keys)
+                {
+                    if (line.IndexOf(histKey, StringComparison.OrdinalIgnoreCase) >= 0) // "Urteil" matches "Urteil"
+                    {
+                        foreach (var histMarkerPattern in history[histKey].Keys) // Keys: "vorgelegt als", "Anlage", Regex, "|"
+                        {
+                            if (!activeMarkers.Any(am => am.SearchPattern == histMarkerPattern))
+                            {
+                                var def = markerDefinitions.First(m => m.SearchPattern == histMarkerPattern);
+                                def.TargetColumnIndex = nextColIndex++;
+                                activeMarkers.Add(def);
+                            }
+                        }
+                    }
+                }
+            }
+             
+             
+             
+
+            This works. The "|" column is added. 
+
+            BUT what if Table 2 has NO pipe in the text, BUT the other rows in Table 2 do NOT match any history key?
+            Example Table 2 text:
+            "Urteil"
+            "Ein ganz anderer Text ohne Marker und ohne Historie"
+            Phase 1b processes "Urteil" -> adds "|" to activeMarkers.
+            Phase 1b processes "Ein ganz anderer Text..." -> no history match. Doesn't change activeMarkers.
+            Result: array has 5 columns (Haupt, vorgelegt, Anlage, Regex, |).
+            Row 1 ("Urteil"): Haupt="Urteil", others filled by history, Pipe is set to Empty.
+            Row 2 ("Ein ganz anderer Text..."): Haupt="Ein ganz anderer Text...", others Empty, Pipe Empty.
+            This is correct! The column exists. 
+
+            What if the user's text is:
+            "Vertrag vom 18.04.2013 vorgelegt als Anlage K123 |" (has pipe in text)
+            "Urteil" (matches history, history HAS pipe)
+            Phase 1a finds "|" in line 1 -> adds "|" to activeMarkers.
+            Phase 2 line 1: fills pipe.
+            Phase 2 line 2 ("Urteil"): history fills other markers. Pipe is suppressed (set to Empty).
+            Column exists. This is correct. 
+
+            What if the history DOES NOT contain a pipe?
+            History key "Urteil" has values: "vorgelegt als", "Anlage", Regex. No pipe.
+            Then Phase 1b doesn't add the pipe.
+            If Table 2 text: "Urteil |" (has pipe)
+            Phase 1a adds "|".
+            Phase 2 line "Urteil |": parses Haupt="Urteil", Pipe="|". History fills vorgelegt/Anlage/Regex.
+            Wait, history fills the others?
+            "Urteil" matches history. History doesn't have pipe.
+            The text has pipe.
+            The pipe from the text is parsed.
+            This is correct. 
+
+            Let's rethink: Why did the user say the column is missing or not constructed?
+            Look at the picture again.
+            Table 1:
+            Row 1: Vertrag vom 18.04.2013 ... | vorgelegt als | Anlage | K123 | [Pipe Column]
+            Row 2: Urteil | vorgelegt als | Anlage | AG45 | [Pipe Column]
+            Table 2 (in the picture, it seems):
+            Row 1: Vertrag vom 18.04.2013 ... | vorgelegt als | Anlage | K123 | [Pipe Column - wait, is it there?]
+            Row 2: Urteil | vorgelegt als | Anlage | AG45 | [Pipe Column is MISSING?]
+            If the pipe column is missing, it means the array generated for Table 2 didn't have the Pipe column, OR the user's code that converts the array to a Word table dynamically adjusted the columns.
+            Since the user says gdrstg.GetLength(1) + 1, the number of columns in the Word table is strictly determined by the array's column count.
+            So if the Word table lacks the column, the ARRAY lacked the column. 
+
+            When would the array lack the pipe column in Table 2?
+            Suppose Table 2 text is ONLY:
+            "Urteil"
+            And "Urteil" is in history. History HAS the pipe.
+            My Phase 1b code: 
+            csharp
+             
+              
+             
+            if (line.IndexOf(histKey, StringComparison.OrdinalIgnoreCase) >= 0)
+             
+             
+             
+
+            If histKey is "Urteil", it adds ALL markers from history["Urteil"].Keys.
+            If the history correctly extracted the pipe, it should be there. 
+
+            Wait, what if the history extraction FAILED to extract the pipe?
+            In WordTableHistoryExtractor: 
+            csharp
+             
+              
+             
+            try
+            {
+                if (cellText.Contains("|") && table.Cell(r, c).Range.ParagraphFormat.Alignment == Word.WdParagraphAlignment.wdAlignParagraphRight)
+                {
+                    rowHistory["|"] = ("|", "r");
+                    hasData = true;
+                    continue;
+                }
+            }
+            catch { /* Alignment-Check fehlgeschlagen */ }
+             
+             
+             
+
+            If ParagraphFormat.Alignment throws an exception, or if cellText.Contains("|") is false (maybe the cell just contains a border but no text?), the pipe won't be added to rowHistory.
+            Actually, if a cell is completely empty, cellText is empty.
+            But for a pipe, we set the text to "|" AND the flag to "r".
+            Wait, in WordTableParser Phase 2: 
+            csharp
+             
+              
+             
+            if (marker.IsPipe)
+            {
+                resultArray[rowIdx, marker.TargetColumnIndex, 1] = "r";
+            }
+             
+             
+             
+
+            The text (resultArray[rowIdx, marker.TargetColumnIndex, 0]) is set to "|" (matchedText.Trim()).
+            So when the user writes this to Word, they probably write "|" into the cell, and apply right alignment.
+            So cellText in the extractor will be "|", and Alignment will be Right.
+            So the history should extract it. 
+
+            Let's reconsider the user's prompt:
+            "in der weiteren tabelle wo die gefundenen marker nachgetragen werden aber der pipe-strich nicht wiederholt wird, soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird, denn sonst sehen die tabellen nicht gleich aus."
+            "auch wenn in der spalte nie etwas eingetragen wird" -> This implies there are scenarios where the Pipe column might not be added to activeMarkers because it's not in the text AND it's not properly forced by the history logic. 
+
+            Let's look at the scenario:
+            Table 1: "Urteil vorgelegt als: Anlage: AG45 |" -> Parser creates: [0]Urteil, [1]vorgelegt als, [2]Anlage, [3]AG45, [4]|
+            History Extractor creates: "Urteil" -> { "vorgelegt als":(...), "Anlage":(...), Regex:(...), "|":(Flag="r") }
+            Table 2: "Urteil" -> Phase 1a finds no markers. Phase 1b finds "Urteil" in history, adds all 4 markers. Array has 5 columns.
+            Phase 2: "Urteil" goes to [0]. History logic fills [1], [2], [3]. For [4], it sees pattern="|", histFlag="r". It sets [4] text="" and flag="".
+            Wait, if it sets text="" and flag="", the cell is COMPLETELY EMPTY in the array.
+            When the user generates the Word table, if a cell is completely empty, does the column collapse or look weird?
+            The user explicitly said: "soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird".
+            The array has the column (5 columns). The user creates a 6-column Word table.
+            But maybe the issue is that if all rows in Table 2 have an empty pipe column, the user's Word generation code might not render the column borders or it looks like it doesn't exist?
+            No, the user creates the table with a fixed number of columns: gdrstg.GetLength(1) + 1. Word will create the columns. If they are empty, they are still there with borders (unless borders are removed).
+            BUT what if the user's Word generation code does NOT write an empty column? Unlikely. 
+
+            Wait, I see a subtle bug in Phase 1b. 
+            csharp
+             
+              
+             
+            foreach (var line in arrTextLines)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                foreach (var histKey in history.Keys)
+                {
+                    if (line.IndexOf(histKey, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        foreach (var histMarkerPattern in history[histKey].Keys)
+                        {
+                            if (!activeMarkers.Any(am => am.SearchPattern == histMarkerPattern))
+                            {
+                                var def = markerDefinitions.First(m => m.SearchPattern == histMarkerPattern);
+                                def.TargetColumnIndex = nextColIndex++;
+                                activeMarkers.Add(def);
+                            }
+                        }
+                    }
+                }
+            }
+             
+             
+             
+
+            This code adds markers from the history only if the line contains the histKey.
+            What if histKey is "Urteil" and line is "Urteil"? It matches.
+            What if histKey is "Vertrag vom 18.04.2013"? It matches.
+            This works. 
+
+            But what if we want the table columns to be consistent across the entire document, even if a particular table doesn't have any matches at all?
+            "soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird, denn sonst sehen die tabellen nicht gleich aus."
+            The user is saying: If the history dictates that a "Pipe" column exists (because it existed in Table 1), then Table 2 MUST also have a Pipe column, even if Table 2 never uses it.
+            Currently, Table 2 only gets the Pipe column if one of its lines matches a histKey that had a Pipe column.
+            What if Table 2 has completely different lines, no history match at all? Then Table 2 won't get the Pipe column, and it will look different from Table 1.
+            Is that what the user means?
+            "in der weiteren tabelle wo die gefundenen marker nachgetragen werden aber der pipe-strich nicht wiederholt wird..." -> This specifically mentions the table where markers ARE added (so there IS a history match).
+            "...soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird"
+            So the history match happens. The column is added to the array.
+            Then why is it not working for the user? 
+
+            Let's look at how the pipe is handled in Phase 2: 
+            csharp
+             
+              
+             
+            if (pattern == "|")
+            {
+                if (histFlag == "r") // Wenn in der Historie bereits ein Pipe-Strich war -> lösche den neuen
+                {
+                    resultArray[rowIdx, colIdx, 0] = string.Empty;
+                    resultArray[rowIdx, colIdx, 1] = string.Empty;
+                }
+            }
+             
+             
+             
+
+            If histFlag is "r", we clear the cell. The cell is completely empty.
+            When the user writes this to Word, does the pipe column exist? Yes, because totalColumns includes it.
+            Maybe the problem is that the user expects a placeholder or something so the column has a width?
+            No, Word columns have width even if empty. 
+
+            Let's re-read the code very carefully. 
+            csharp
+             
+              
+             
+            if (pattern == "|")
+            {
+                if (histFlag == "r") // Wenn in der Historie bereits ein Pipe-Strich war -> lösche den neuen
+                {
+                    resultArray[rowIdx, colIdx, 0] = string.Empty;
+                    resultArray[rowIdx, colIdx, 1] = string.Empty;
+                }
+            }
+             
+             
+             
+
+            Wait! What if the current line also has a pipe, but we suppress it?
+            Line: "Urteil |"
+            Phase 1a finds "|", adds to activeMarkers.
+            Phase 2 finds "|", puts "|" in the cell, flag "r".
+            Then history logic runs. histFlag is "r". We OVERWRITE the cell with string.Empty and flag "".
+            This is exactly what the user wanted: "Wenn es vorher schon da ist, dann soll es in der neuen Tabelle nicht mehr erscheinen, auch wenn es diktiert wurde."
+            So the cell becomes empty. 
+
+            Is it possible that the user is complaining about the visual appearance in Word? If a column is entirely empty across all rows, Word might auto-fit its width to 0 or a very tiny width if wdAutoFitFixed isn't set up with fixed widths, or if the user's code calculates column widths based on content.
+            But the user's code uses wdAutoFitFixed. The default width is usually evenly distributed. So an empty column should still have width. 
+
+            Let's look at the image provided.
+            Image description:
+            Row 1: Beweis: | Vertrag vom 18.04.2013 | vorgelegt als | Anlage | K123 |
+            Row 2: Beweis: | Urteil | vorgelegt als | Anlage | AG45 |
+            Wait, the image text in my previous turn was:
+            "Beweis: Vertrag vom 18.04.2013... vorgelegt als Anlage K123"
+            It looks like a single visual block, but it's a table.
+            Let me read the prompt's image description:
+            "图片为Word文档界面，包含表格与文字。表格列有“Beweis:”“Vertrag vom 18.04.2013...”“vorgelegt als”“Anlage”“K123”等，多行列出日期、文本及编号（如K123、AG45）；文档底部有“mit freundlichen Grüßen”；上方是排版工具栏。关键文字涉及证明、日期、附件等内容。"
+            So there are columns for "Beweis:", "Vertrag...", "vorgelegt als", "Anlage", "K123" / "AG45".
+            Where is the Pipe column?
+            In the previous image, the pipe was clearly there as a separate column at the end.
+            Maybe in the current image, the Pipe column is missing in the second row? 
+
+            Let's think about how WordTableParser generates the array.
+            If a row in Table 2 has NO pipe in the text, and NO history match, it won't have the pipe column in the array.
+            Wait, the array size is [validRowCount, totalColumns, 2]. totalColumns is determined by nextColIndex, which is global for the whole table.
+            If Row 1 matches history and adds the pipe column, ALL rows in the table get the pipe column in the array.
+            So the Word table WILL have the pipe column. 
+
+            Let's reconsider the user's problem: "soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird"
+            Maybe the user is talking about the scenario where the entire Table 2 has no pipes and no history matches that contain pipes?
+            "in der weiteren tabelle wo die gefundenen marker nachgetragen werden aber der pipe-strich nicht wiederholt wird" -> This specifically talks about the table where markers ARE added from history.
+            So the history match happens.
+            What if the history contains the pipe marker, Phase 1b adds it, so the array has the column.
+            Then Phase 2 clears the cell content (sets to string.Empty).
+            When the user's C# code reads the array and populates the Word table, they might be doing: 
+            csharp
+             
+              
+             
+            for (int c = 0; c < cols; c++) {
+                if (!string.IsNullOrEmpty(array[r, c, 0])) {
+                   cell.Text = array[r, c, 0];
+                }
+            }
+             
+             
+             
+
+            This is fine. 
+
+            Wait! I think I see the issue.
+            In WordTableHistoryExtractor, how do we extract the pipe? 
+            csharp
+             
+              
+             
+            if (cellText.Contains("|") && table.Cell(r, c).Range.ParagraphFormat.Alignment == Word.WdParagraphAlignment.wdAlignParagraphRight)
+            {
+                rowHistory["|"] = ("|", "r");
+                // ...
+            }
+             
+             
+             
+
+            What if the cell in Word contains ONLY the Pipe, but the alignment is NOT explicitly set to Right because the whole column is styled via a style, or the user's code doesn't set ParagraphFormat.Alignment?
+            If the user's code does: 
+            csharp
+             
+              
+             
+            if (flag == "r") {
+                cell.Range.ParagraphFormat.Alignment = WdAlignParagraphRight;
+            }
+             
+             
+             
+
+            Then it IS set to Right.
+            But what if the pipe is extracted correctly?
+            Let's assume the history is correctly populated with "|": ("|", "r").
+            Phase 1b adds "|" to activeMarkers.
+            totalColumns includes the pipe column.
+            Phase 2: history logic sets the pipe cell to string.Empty.
+            Everything seems logically sound on the parser side. 
+
+            Could the user's issue be that Phase 1b does NOT add the pipe column if the current text line does not match the history key?
+            Yes! Look at Phase 1b: 
+            csharp
+             
+              
+             
+            foreach (var line in arrTextLines)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                foreach (var histKey in history.Keys)
+                {
+                    if (line.IndexOf(histKey, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        foreach (var histMarkerPattern in history[histKey].Keys)
+                        {
+                            if (!activeMarkers.Any(am => am.SearchPattern == histMarkerPattern))
+                            {
+                                var def = markerDefinitions.First(m => m.SearchPattern == histMarkerPattern);
+                                def.TargetColumnIndex = nextColIndex++;
+                                activeMarkers.Add(def);
+                            }
+                        }
+                    }
+                }
+            }
+             
+             
+             
+
+            If arrTextLines contains "Urteil", it matches histKey "Urteil".
+            The history for "Urteil" contains "vorgelegt als", "Anlage", "AG45", and "|".
+            So ALL of these are added to activeMarkers.
+            This means the Pipe column IS constructed. 
+
+            Is there any edge case?
+            What if the history for "Urteil" DOES NOT contain the pipe?
+            Why wouldn't it?
+            Because in Table 1, "Urteil" didn't have a pipe?
+            But the user said: "wenn in einer weiteren tabelle in einer zeile der gleiche haupttext wie in einer zeile einer früheren tabelle vorkommt, dass die restlichen spalten in der folgetabelle von der früheren übernommen werden... lediglich das Pipe-Zeichen "|" soll nur ein mal vorkommen."
+            This implies Table 1 HAD a pipe for "Urteil".
+            So history has it. 
+
+            Let's re-read the specific complaint: "soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird, denn sonst sehen die tabellen nicht gleich aus."
+            Maybe the user is looking at the generated Word table, and the empty Pipe column has no borders, or it's collapsed?
+            If a column has completely empty cells, sometimes Word tables can look weird if not styled properly.
+            But more likely, the user noticed that if Table 2 has text: "Urteil" (no markers), the parser only creates columns for what's in the history.
+            Wait. If Table 2 has "Urteil", and history has "vorgelegt als", "Anlage", "AG45", "|".
+            The parser creates columns: 0(Haupt), 1(vorgelegt), 2(Anlage), 3(AG45), 4(|).
+            Then Phase 2 clears the pipe cell (sets to empty).
+            So column 4 is there, but empty.
+            This exactly matches "tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird".
+            So it should already be doing what the user wants! 
+
+            Why does the user say "hab noch eine anforderung vergessen: ... soll trotzdem die tabellenspalte konstruiert werden"?
+            Because maybe it is NOT constructing it currently!
+            Why would it not construct it?
+            Let's trace:
+            Table 1: "Urteil vorgelegt als Anlage AG45 |"
+            History "Urteil" -> {"vorgelegt als", "Anlage", "AG45", "|"}
+            Table 2: "Urteil"
+            Phase 1a: Scans "Urteil". Finds NO markers. nextColIndex = 1. activeMarkers is empty.
+            Phase 1b: Scans "Urteil". Matches histKey "Urteil".
+            Iterates histMarkerPattern in history["Urteil"].Keys.
+            Adds "vorgelegt als" (col 1).
+            Adds "Anlage" (col 2).
+            Adds "AG45" (col 3).
+            Adds "|" (col 4).
+            totalColumns = 5.
+            Phase 2: Parses "Urteil". No markers found in text. resultArray[0, 0, 0] = "Urteil".
+            History logic: matchedHistoryKey = "Urteil".
+            histEntry = {"vorgelegt als":..., "Anlage":..., "AG45":..., "|":("|", "r")}.
+            For "vorgelegt als": resultArray[0, 1, 0] = "vorgelegt als:".
+            For "Anlage": resultArray[0, 2, 0] = "Anlage:".
+            For "AG45": resultArray[0, 3, 0] = "AG45".
+            For "|": pattern is "|", histFlag is "r". We enter if (pattern == "|") { if (histFlag == "r") { resultArray[0, 4, 0] = string.Empty; resultArray[0, 4, 1] = string.Empty; } }.
+            So resultArray[0, 4, 0] is empty.
+            This works perfectly. The column is constructed (index 4 exists), but it's empty. 
+
+            Wait, look at this:
+            What if the user's text in Table 2 is:
+            "Urteil |" (the user DICTATED the pipe again).
+            Phase 1a: Scans "Urteil |". FINDS "|"! Adds "|" to activeMarkers. nextColIndex = 2 (0 and |).
+            Phase 1b: Matches "Urteil" to history. Adds "vorgelegt als" (col 2), "Anlage" (col 3), "AG45" (col 4).
+            Wait, activeMarkers already has "|".
+            So in Phase 1b: 
+            csharp
+             
+              
+             
+            if (!activeMarkers.Any(am => am.SearchPattern == histMarkerPattern))
+             
+             
+             
+
+            For "|", it IS in activeMarkers, so it DOES NOT add it again. It keeps its TargetColumnIndex = 1.
+            So totalColumns = 5. Col 0=Haupt, Col 1=|, Col 2=vorgelegt, Col 3=Anlage, Col 4=AG45.
+            Phase 2:
+            searchStartPosition = 0.
+            Finds "|". textBeforeMarker = "Urteil". lastFoundMarkerCol = 1.
+            resultArray[0, 0, 0] = "Urteil".
+            resultArray[0, 1, 0] = "|". Flag = "r".
+            searchStartPosition moves past "|".
+            History logic:
+            Matches "Urteil".
+            histEntry has "vorgelegt als", "Anlage", "AG45", "|".
+            For "vorgelegt als": activeMarker is found (col 2). resultArray[0, 2, 0] = "vorgelegt als:".
+            For "Anlage": activeMarker is found (col 3). resultArray[0, 3, 0] = "Anlage:".
+            For "AG45": activeMarker is found (col 4). resultArray[0, 4, 0] = "AG45".
+            For "|": activeMarker is found (col 1). histFlag is "r".
+            We enter if (pattern == "|") { if (histFlag == "r") { resultArray[0, 1, 0] = string.Empty; resultArray[0, 1, 1] = string.Empty; } }.
+            So we CLEAR the pipe cell!
+            This is exactly what the user wanted! The pipe was dictated, but we suppress it.
+            And the column is constructed. 
+
+            So why is the user saying the column is not constructed or they look different?
+            Look at the order of columns!
+            Table 1: [Haupt] [vorgelegt] [Anlage] [AG45] [|]
+            Table 2: [Haupt] [|] [vorgelegt] [Anlage] [AG45]
+            Because in Table 2, the pipe was dictated in the text, Phase 1a found it FIRST and assigned it Col 1. Then Phase 1b found the history markers and assigned them Col 2, 3, 4.
+            So the columns are out of order compared to Table 1!
+            "denn sonst sehen die tabellen nicht gleich aus" -> THIS IS IT!
+            The columns are in the wrong order in Table 2 because the pipe was parsed from text before the history markers were added!
+            In Table 1, the text was "Urteil vorgelegt als Anlage AG45 |", so the order of discovery in Phase 1a was: vorgelegt (1), Anlage (2), AG45 (3), | (4).
+            In Table 2, the text is "Urteil | vorgelegt als Anlage AG45" (or just "Urteil |"). Phase 1a finds | first, so it gets col 1. History adds vorgelegt, Anlage, AG45 as 2, 3, 4.
+            The columns are swapped!
+            If you look at the picture, Table 2 probably has the Pipe column in the wrong place, or if "Urteil" had no other markers dictated, it's just [Haupt] [|], and the other markers are missing or in a weird order. 
+
+            Wait, if Table 2 text is just "Urteil", Phase 1a finds NOTHING. Phase 1b adds vorgelegt (1), Anlage (2), AG45 (3), | (4).
+            Then the order is exactly the same as Table 1! Because Phase 1b adds them in the order of history[histKey].Keys.
+            And history[histKey].Keys order depends on how it was built in WordTableHistoryExtractor.
+            In WordTableHistoryExtractor: 
+            csharp
+             
+              
+             
+            for (int c = 3; c <= table.Columns.Count; c++)
+            {
+                // ...
+                if (cellText.Contains("|")...) {
+                    rowHistory["|"] = ("|", "r");
+                }
+                // ...
+                foreach (var marker in markerDefinitions) {
+                    // ...
+                    rowHistory[marker.SearchPattern] = (cellText, string.Empty);
+                }
+            }
+             
+             
+             
+
+            rowHistory is a Dictionary<string, (string, string)>. In modern .NET, Dictionary preserves insertion order (as long as no deletions occur).
+            Since we iterate c from 3 to Columns.Count, the markers are inserted into rowHistory in the left-to-right column order!
+            So rowHistory.Keys will be in the correct order: "vorgelegt als", "Anlage", "AG45", "|".
+            So Phase 1b will add them in the correct order: vorgelegt (1), Anlage (2), AG45 (3), | (4).
+            This means if Table 2 has ONLY "Urteil", the columns are in the exact same order as Table 1. 
+
+            But what if Table 2 text is: "Urteil |"?
+            Phase 1a finds "|", adds it as Col 1.
+            Phase 1b finds "Urteil", adds vorgelegt (2), Anlage (3), AG45 (4).
+            The pipe is Col 1, but it should be Col 4!
+            THIS is why the tables look different! 
+
+            To fix this, we need to ensure that the column order is consistent.
+            The column order should ALWAYS be dictated by markerDefinitions.
+            Phase 1a currently assigns TargetColumnIndex = nextColIndex++ in the order they are found in the text.
+            This is fine for a standalone table.
+            But when mixing with history, we need to respect the canonical order of markers. 
+
+            Actually, how about we just change Phase 1b to enforce the canonical order, and if a marker is already in activeMarkers, we don't change it, but we ALSO shouldn't have added it out of order in Phase 1a!
+            Wait, Phase 1a just appends to activeMarkers in the order it finds them in the text.
+            If the text has "|" before "Anlage", "|" gets a lower column index than "Anlage".
+            This means the Word table will have the Pipe column before the Anlage column.
+            Is that what the user wants?
+            "denn sonst sehen die tabellen nicht gleich aus" -> The user wants the tables to look the same. This means the columns must be in the same order.
+            The order should probably be the order defined in markerDefinitions!
+            "vorgelegt als" -> Col 1
+            "Anlage" -> Col 2
+            Regex -> Col 3
+            "|" -> Col 4 
+
+            Let's change the column assignment logic to ALWAYS follow the canonical order from markerDefinitions, regardless of where they appear in the text.
+            No, wait. The user's rule was: "Dynamische Spaltenerkennung... Spalte 0 ist IMMER reserviert für den Haupttext."
+            If we force the order based on markerDefinitions, then the columns will always be in the same order.
+            Let's modify Phase 1 to assign column indices based on markerDefinitions order. 
+            csharp
+             
+              
+             
+            // PHASE 1: Analyse
+            var activeMarkers = new List<MarkerDef>();
+            int nextColIndex = 1; 
+
+            // 1a: Normale Analyse des aktuellen Textes
+            foreach (var marker in markerDefinitions)
+            {
+                bool markerFoundInAnyLine = arrTextLines.Any(line => IsMarkerPresentInLine(marker, line));
+                if (markerFoundInAnyLine)
+                {
+                    marker.TargetColumnIndex = nextColIndex++;
+                    activeMarkers.Add(marker);
+                }
+            }
+             
+             
+             
+
+            This ALREADY iterates markerDefinitions in order!
+            So Phase 1a ALWAYS assigns columns in the canonical order: vorgelegt, Anlage, Regex, Pipe.
+            If the text is "Urteil | Anlage", Phase 1a checks markerDefinitions in order: 
+                 "vorgelegt als": not found.
+                 "Anlage": found! TargetColumnIndex = 1.
+                 Regex: not found.
+                 "|": found! TargetColumnIndex = 2.
+                So the columns will be: 0:Urteil, 1:Anlage, 2:|.
+                This preserves the canonical order! My code ALREADY does this.
+                Let me double check Phase 1a.
+                 
+            csharp
+             
+              
+             
+            foreach (var marker in markerDefinitions)
+            {
+                bool markerFoundInAnyLine = arrTextLines.Any(line => IsMarkerPresentInLine(marker, line));
+                if (markerFoundInAnyLine)
+                {
+                    marker.TargetColumnIndex = nextColIndex++;
+                    activeMarkers.Add(marker);
+                }
+            }
+             
+             
+             
+
+            Yes! It iterates markerDefinitions, not the lines.
+            So if a line has "|" and "Anlage", "Anlage" will be checked first (because it's earlier in markerDefinitions), so "Anlage" gets Col 1, "|" gets Col 2.
+            So the column order is ALWAYS consistent with markerDefinitions. 
+
+            Then why does the user say the tables don't look the same?
+            Let's look at Phase 1b: 
+            csharp
+             
+              
+             
+            // 1b: Historien-Analyse
+            if (history != null)
+            {
+                foreach (var line in arrTextLines)
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    foreach (var histKey in history.Keys)
+                    {
+                        if (line.IndexOf(histKey, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            foreach (var histMarkerPattern in history[histKey].Keys)
+                            {
+                                if (!activeMarkers.Any(am => am.SearchPattern == histMarkerPattern))
+                                {
+                                    var def = markerDefinitions.First(m => m.SearchPattern == histMarkerPattern);
+                                    def.TargetColumnIndex = nextColIndex++;
+                                    activeMarkers.Add(def);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+             
+             
+             
+
+            If histMarkerPattern is "vorgelegt als", and it's not in activeMarkers, we find it in markerDefinitions and add it.
+            But wait! If activeMarkers already contains "|", and we add "vorgelegt als" from history, "vorgelegt als" gets nextColIndex (which is higher than "|"!).
+            Example:
+            Table 2 text: "Urteil |"
+            Phase 1a: 
+                 "vorgelegt als": not found.
+                 "Anlage": not found.
+                 Regex: not found.
+                 "|": found. TargetColumnIndex = 1. nextColIndex = 2.
+                Phase 1b:
+                 Matches "Urteil". History has "vorgelegt als", "Anlage", Regex, "|".
+                 "vorgelegt als": not in activeMarkers. Add it. TargetColumnIndex = 2.
+                 "Anlage": not in activeMarkers. Add it. TargetColumnIndex = 3.
+                 Regex: not in activeMarkers. Add it. TargetColumnIndex = 4.
+                 "|": ALREADY in activeMarkers. Skip.
+                Result: Col 0=Haupt, Col 1=|, Col 2=vorgelegt, Col 3=Anlage, Col 4=Regex.
+                THE ORDER IS WRONG! The Pipe is Col 1, but it should be Col 4!
+                This is exactly the bug!
+                Because we add missing markers from history after Phase 1a, they get appended at the end, violating the canonical order of markerDefinitions!
+                 
+
+            How to fix this?
+            We should determine activeMarkers and their TargetColumnIndex based on ALL markers that are either in the text OR in the matched history, but we must assign the column indices in the canonical order of markerDefinitions! 
+
+            Let's rethink Phase 1 completely: 
+                Find all unique SearchPatterns that are present either in arrTextLines OR in a matched histKey in history. 
+                Iterate markerDefinitions in order. If a marker's SearchPattern is in the set of found patterns, assign it the next TargetColumnIndex. 
+
+            Let's trace this new logic: 
+            csharp
+             
+              
+             
+            // PHASE 1: Analyse
+            var requiredPatterns = new HashSet<string>();
+
+            // 1a: Normale Analyse des aktuellen Textes
+            foreach (var marker in markerDefinitions)
+            {
+                bool markerFoundInAnyLine = arrTextLines.Any(line => IsMarkerPresentInLine(marker, line));
+                if (markerFoundInAnyLine)
+                {
+                    requiredPatterns.Add(marker.SearchPattern);
+                }
+            }
+
+            // 1b: Historien-Analyse
+            if (history != null)
+            {
+                foreach (var line in arrTextLines)
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    foreach (var histKey in history.Keys)
+                    {
+                        if (line.IndexOf(histKey, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            foreach (var histMarkerPattern in history[histKey].Keys)
+                            {
+                                requiredPatterns.Add(histMarkerPattern);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 1c: Spalten-Indizes in der kanonischen Reihenfolge zuweisen
+            var activeMarkers = new List<MarkerDef>();
+            int nextColIndex = 1; 
+
+             
+             
+             
+
+            Let's trace the buggy scenario with this new logic:
+            Table 2 text: "Urteil |"
+            Phase 1a: finds "|". requiredPatterns = {"|"}.
+            Phase 1b: matches "Urteil". History has "vorgelegt als", "Anlage", "AG45", "|".
+            requiredPatterns = {"|", "vorgelegt als", "Anlage", "AG45"}.
+            Phase 1c:
+            Iterate markerDefinitions: 
+                 "vorgelegt als" is in requiredPatterns -> Col 1
+                 "Anlage" is in requiredPatterns -> Col 2
+                 "AG45" is in requiredPatterns -> Col 3
+                 "|" is in requiredPatterns -> Col 4
+                Result: Col 0=Haupt, Col 1=vorgelegt, Col 2=Anlage, Col 3=AG45, Col 4=|.
+                Perfect! The order is strictly maintained according to markerDefinitions.
+                 
+
+            Let's trace another scenario:
+            Table 2 text: "Urteil"
+            Phase 1a: finds nothing. requiredPatterns = {}.
+            Phase 1b: matches "Urteil". History has "vorgelegt als", "Anlage", "AG45", "|".
+            requiredPatterns = {"vorgelegt als", "Anlage", "AG45", "|"}.
+            Phase 1c: 
+                 "vorgelegt als" -> Col 1
+                 "Anlage" -> Col 2
+                 "AG45" -> Col 3
+                 "|" -> Col 4.
+                Perfect!
+                 
+
+            Let's trace scenario where history DOES NOT have the pipe, but Table 2 text has it:
+            Table 2 text: "Urteil |"
+            History "Urteil" has: "vorgelegt als", "Anlage", "AG45" (no pipe).
+            Phase 1a: finds "|". requiredPatterns = {"|"}.
+            Phase 1b: matches "Urteil". requiredPatterns = {"|", "vorgelegt als", "Anlage", "AG45"}.
+            Phase 1c: 
+                 "vorgelegt als" -> Col 1
+                 "Anlage" -> Col 2
+                 "AG45" -> Col 3
+                 "|" -> Col 4.
+                Perfect!
+                 
+
+            This new Phase 1 logic is much more robust and guarantees that tables ALWAYS have the same column order, which directly solves the user's complaint: "soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird, denn sonst sehen die tabellen nicht gleich aus." 
+
+            Wait, the user also said: "in der weiteren tabelle wo die gefundenen marker nachgetragen werden aber der pipe-strich nicht wiederholt wird, soll trotzdem die tabellenspalte konstruiert werden, auch wenn in der spalte nie etwas eingetragen wird"
+            With the new logic, the Pipe column IS constructed (Col 4), even if the history logic clears its content in Phase 2.
+            So the Word table will have an empty column at the end, perfectly aligning with Table 1. 
+
+            Let's review Phase 2 History logic: 
+            csharp
+             
+              
+             
+            if (pattern == "|")
+            {
+                if (histFlag == "r") // Wenn in der Historie bereits ein Pipe-Strich war -> lösche den neuen
+                {
+                    resultArray[rowIdx, colIdx, 0] = string.Empty;
+                    resultArray[rowIdx, colIdx, 1] = string.Empty;
+                }
+            }
+             
+             
+             
+
+            If the history had the pipe, histFlag is "r". We clear the cell.
+            What if the history DID NOT have the pipe, but the current text DOES?
+            histEntry does not contain "|". So the foreach loop doesn't execute for "|".
+            The pipe parsed from the text remains in resultArray. This is correct! (The user said: "Wenn es vorher schon da ist, dann soll es in der neuen Tabelle nicht mehr erscheinen... eine wiederholung der selben anlage muss daher nicht mehr/darf nicht mehr mit dem pipe-zeichen versehen werden").
+            Wait, if the history DID NOT have the pipe, it means this is the FIRST time this "Beweis" gets a pipe. So it SHOULD appear. The logic handles this correctly. 
+
+            Are there any edge cases?
+            What if the user dictates "Urteil |", but the history has NO pipe?
+            Phase 1c: "|" is Col 4.
+            Phase 2 parses "Urteil" into Col 0, "|" into Col 4.
+            History logic: no pipe in history. Col 4 keeps "|". Correct. 
+
+            What if the user dictates "Urteil", but the history HAS a pipe?
+            Phase 1c: "|" is Col 4.
+            Phase 2 parses "Urteil" into Col 0.
+            History logic: "|" is in history with "r". Col 4 is set to Empty. Correct. 
+
+            What if the user dictates "Urteil |", and the history HAS a pipe?
+            Phase 1c: "|" is Col 4.
+            Phase 2 parses "Urteil" into Col 0, "|" into Col 4.
+            History logic: "|" is in history with "r". Col 4 is set to Empty. The dictated pipe is suppressed. Correct. 
+
+            This looks solid. I will present this refactored Phase 1 as the solution to the alignment issue. 
+
+            Let's also double check WordTableHistoryExtractor.
+            When iterating columns, it starts from c = 3 (since 1=Beweis, 2=Haupttext). 
+            csharp
+             
+              
+             
+            for (int c = 3; c <= table.Columns.Count; c++)
+             
+             
+             
+
+            Wait, if the Pipe column is the last column, say column 6.
+            c=3: finds "vorgelegt als"
+            c=4: finds "Anlage"
+            c=5: finds "AG45"
+            c=6: finds "|", adds to rowHistory.
+            The order of keys in rowHistory will be "vorgelegt als", "Anlage", "AG45", "|".
+            This perfectly matches markerDefinitions order.
+            So requiredPatterns will be populated in a consistent order. 
+
+            Is there anything else?
+            The user mentioned: "auch wenn in der spalte nie etwas eingetragen wird"
+            Just to be absolutely sure Word renders the empty column correctly, sometimes an empty string in a table cell causes the cell to collapse if wdAutoFitBehavior.wdAutoFitFixed isn't strictly respected by the user's subsequent formatting.
+            However, that's a Word formatting issue. Our parser's job is to provide the correct 3D array with the correct number of columns. And now it does, with the correct indices. 
+
+            Let's write down the updated WordTableParser code.
+            I will only show the modified ParseLinesToTable method, as the helper methods remain the same. 
+            csharp
+             
+              
+             
+            public string[,,] ParseLinesToTable(string[] arrTextLines, Dictionary<string, Dictionary<string, (string Text, string Flag)>> history = null)
+            {
+                var markerDefinitions = GetMarkerDefinitions();
+
+                // PHASE 1: Analyse
+                var requiredPatterns = new HashSet<string>();
+
+                // 1a: Normale Analyse des aktuellen Textes
+                foreach (var marker in markerDefinitions)
+                {
+                    bool markerFoundInAnyLine = arrTextLines.Any(line => IsMarkerPresentInLine(marker, line));
+                    if (markerFoundInAnyLine)
+                    {
+                        requiredPatterns.Add(marker.SearchPattern);
+                    }
+                }
+
+                // 1b: Historien-Analyse
+                if (history != null)
+                {
+                    foreach (var line in arrTextLines)
+                    {
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        foreach (var histKey in history.Keys)
+                        {
+                            if (line.IndexOf(histKey, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                foreach (var histMarkerPattern in history[histKey].Keys)
+                                {
+                                    requiredPatterns.Add(histMarkerPattern);
+                                }
+                            }
+                        }
+                    }
+                }
+
+             
+             
+             
+
+            Wait, GetMarkerDefinitions() creates NEW MarkerDef instances every time it's called.
+            So markerDefinitions in ParseLinesToTable are fresh instances.
+            requiredPatterns.Contains(marker.SearchPattern) works perfectly. 
+
+            Let's review Phase 2 History Logic to ensure it still works with the new variable activeMarker. 
+            csharp
+             
+              
+             
+            var activeMarker = activeMarkers.FirstOrDefault(m => m.SearchPattern == pattern);
+            if (activeMarker != null)
+            {
+                int colIdx = activeMarker.TargetColumnIndex;
+                // ...
+            }
+             
+             
+             
+
+            This is perfectly fine. 
+
+            One detail: what if the user dictates "Urteil |" but "vorgelegt als" is NOT in the history, and NOT in the text?
+            Table 2 text: "Urteil |"
+            Phase 1a: finds "|". requiredPatterns = {"|"}.
+            Phase 1b: "Urteil" matches history. History has "Anlage", "AG45". (No "vorgelegt als").
+            requiredPatterns = {"|", "Anlage", "AG45"}.
+            Phase 1c: 
+                 "vorgelegt als": NOT in requiredPatterns. Skipped!
+                 "Anlage": Col 1
+                 "AG45": Col 2
+                 "|": Col 3
+                Result: Col 0=Haupt, Col 1=Anlage, Col 2=AG45, Col 3=|.
+                This is correct! We only create columns for markers that actually exist in either the text or the history.
+                 
+
+            Let's make sure WordTableParser is presented clearly, incorporating the GetMarkerDefinitions() static method we discussed earlier. 
+
+            I will formulate the response explaining why the columns were out of order (Phase 1a assigning indices before Phase 1b, causing dictated pipes to shift to the left of historical markers) and how the new Phase 1 fixes it by collecting all required patterns first, and then assigning indices in the canonical order. 
+              
+
+ 
+
+Das ist ein exzellenter Fund! Ich verstehe genau, was du meinst. Das Problem liegt in der Reihenfolge, wie die Spaltenindizes zugewiesen werden. 
+
+Bisher war die Logik so: 
+
+    Phase 1a hat den aktuellen Text gescannt und z.B. das diktierte | gefunden. Das | bekam sofort Spaltenindex 1. 
+    Phase 1b hat die Historie nachgezogen und "vorgelegt als", "Anlage" usw. hinzugefügt. Diese bekamen dann die Indizes 2, 3, 4. 
+    Ergebnis: Die Pipe-Spalte stand in Tabelle 2 ganz links (weil sie im Diktat früh kam), während sie in Tabelle 1 ganz rechts stand. Die Tabellen sahen völlig unterschiedlich aus! 
+
+Die Lösung: Wir müssen die Vergabe der Spaltenindizes (TargetColumnIndex) strikt an die kanonische Reihenfolge der Marker-Definitionen ("vorgelegt als" -> "Anlage" -> Regex -> Pipe) knüpfen, unabhängig davon, ob der Marker aus dem aktuellen Text oder aus der Historie stammt.  
+
+Dafür ändern wir Phase 1: Wir sammeln erst alle benötigten Marker-Patterns (aus Text und Historie), und weisen die Indizes danach strikt in der Reihenfolge unserer zentralen Liste GetMarkerDefinitions() zu. So baut sich die Tabelle immer mit der exakt gleichen Spaltenreihenfolge auf, und die Pipe-Spalte wird als leere Spalte konstruiert, falls sie historisch unterdrückt wird. 
+
+Hier ist die angepasste ParseLinesToTable-Methode (Phase 1 wurde komplett überarbeitet, Phase 2 bleibt logisch gleich): 
+csharp
+ 
+  
+ 
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+
+public class WordTableParser
+{
+    public class MarkerDef
+    {
+        public string SearchPattern { get; set; }
+        public bool IsRegex { get; set; }
+        public bool IsPipe { get; set; }
+        public int TargetColumnIndex { get; set; }
+    }
+
+    public static List<MarkerDef> GetMarkerDefinitions()
+    {
+        return new List<MarkerDef>
+        {
+            new MarkerDef { SearchPattern = "vorgelegt als", IsRegex = false },
+            new MarkerDef { SearchPattern = "Anlage", IsRegex = false },
+            new MarkerDef { SearchPattern = @"\b(K|B|AS|AG)\d+(?::|\b)", IsRegex = true }, 
+            new MarkerDef { SearchPattern = "|", IsRegex = false, IsPipe = true }
+        };
+    }
+
+    public string[,,] ParseLinesToTable(string[] arrTextLines, Dictionary<string, Dictionary<string, (string Text, string Flag)>> history = null)
+    {
+        var markerDefinitions = GetMarkerDefinitions();
+
+        // PHASE 1: Analyse
+        
+        // Wir sammeln erst ALLE Marker-Patterns, die wir für diese Tabelle brauchen
+        var requiredPatterns = new HashSet<string>();
+
+        // 1a: Normale Analyse des aktuellen Textes
+ 
+ 
+ 
+Warum das das Problem löst: 
+
+Selbst wenn in Tabelle 2 nur "Urteil |" diktiert wird: 
+
+    Phase 1a erkennt das |. 
+    Phase 1b zieht "vorgelegt als", "Anlage" und die Regex aus der Historie nach. 
+    Phase 1c sortiert nun alle 4 gefundenen Marker strikt nach der vorgegebenen Reihenfolge und ordnet die Indizes zu: "vorgelegt als" = 1, "Anlage" = 2, Regex = 3, Pipe = 4. 
+    In Phase 2 wird das Pipe-Zeichen aus dem Diktat in Spalte 4 geschrieben. Die Historie erkennt das Pipe-Flag "r" und löscht den Inhalt von Spalte 4 wieder (string.Empty). 
+
+Das resultierende Array hat exakt 5 Spalten (0 bis 4). Wenn du dieses Array nun in Word als Tabelle erzeugst (gdrstg.GetLength(1) + 1 = 6 Spalten), wird die Pipe-Spalte als optisch leere, aber strukturell vorhandene Spalte am Ende erzeugt – genau wie in der Tabelle davor! 
+      
+ 
+ 
+ 
+<< Selbst wenn in Tabelle 2 nur "Urteil |" diktiert wird: >> wenn in der ersten tabelle steht "Vertrag vom 18.04.2013 vorgelegt als Anlage K123 |", so muss in der tabelle nicht mal der pipe-strich diktiert werden, sondern es muss nur der haupttext passen "Vertrag vom 18.04.2013", um die anderen marker wie gehabt zu ergänzen. auch hier soll der pipe-strich nicht wiederholt werden, aber trotzdem die spalte dafür vorgesehen werden wegen gleicher tabellenoptik 
+ 
+  
+  
+profile
+GLM-5.1
+   
+ 
+ 
+
+        Analyze the User's Request: 
+             Context: The user is working with a C# WordTableParser and WordTableHistoryExtractor.
+             Current State: The parser creates a 3D array from text lines. The history extractor reads existing Word tables to provide a history dictionary to the parser so that if a main text repeats in a subsequent table, its markers are automatically filled in (except the pipe |, which should be blanked out if it was already present in the history to avoid counting it twice).
+             New Requirement/Clarification: The user clarifies a scenario. If Table 1 has "Vertrag vom 18.04.2013 vorgelegt als Anlage K123 |", and in Table 2 the user only dictates "Vertrag vom 18.04.2013" (without any markers, not even the pipe), the parser should still automatically add the "vorgelegt als", "Anlage", "K123" from the history, suppress the | (because it was in the history), but ensure the structural column for the | exists so Table 2 looks identical to Table 1 (same number of columns, just the last one is empty).
+             Analysis of the existing code: Let's trace the existing code with the input "Vertrag vom 18.04.2013".
+                 Phase 1a (Current text analysis): Scans the text. Finds no markers (no "vorgelegt als", no "Anlage", no Regex, no Pipe). requiredPatterns remains empty.
+                 Phase 1b (History analysis): Checks if any history key matches the current line. "Vertrag vom 18.04.2013" matches! It iterates through the history entry for this key. The history entry contains "vorgelegt als", "Anlage", Regex, and |. It adds all these patterns to requiredPatterns.
+                 Phase 1c (Index assignment): Iterates through markerDefinitions. Since all patterns are in requiredPatterns, it assigns indices to all of them, including the Pipe. activeMarkers contains all markers.
+                 Result array generation: totalColumns will be 5 (Col 0: Main, Col 1: vorgelegt, Col 2: Anlage, Col 3: Regex, Col 4: Pipe). This creates the correct structure!
+                 Phase 2 (Splitting): Processes "Vertrag vom 18.04.2013". Finds no markers in the text itself. The whole text goes to Column 0.
+                 History Logic: Looks up "Vertrag vom 18.04.2013". Finds the history entry. Iterates through it.
+                     "vorgelegt als" -> Col 1 is empty -> fills it.
+                     "Anlage" -> Col 2 is empty -> fills it.
+                     Regex -> Col 3 is empty -> fills it.
+                     | -> History had Flag "r" -> Blanks out Col 4 (Text = "", Flag = "").
+                     
+                 
+             Conclusion: The existing code already perfectly handles the exact scenario the user described! The logic from the previous step (using HashSet<string> requiredPatterns and assigning indices canonically) guarantees that the columns are built based on the union of current markers AND historical markers, and the history fill logic correctly populates them while blanking the Pipe if it was already used.
+              
+
+        Formulate the Response: 
+             Acknowledge the user's scenario explicitly.
+             Confirm enthusiastically that the code already does exactly this.
+             Walk through the scenario step-by-step using the current logic to prove it to the user. This builds confidence and ensures we are on the same page.
+                 Input: "Vertrag vom 18.04.2013"
+                 Phase 1a: finds nothing.
+                 Phase 1b: finds match in history -> adds all history patterns ("vorgelegt als", "Anlage", Regex, "|") to the required list.
+                 Phase 1c: assigns indices to ALL of them -> Array gets 5 columns.
+                 Phase 2: no text markers found -> Col 0 = "Vertrag vom 18.04.2013", rest empty.
+                 History Fill: pulls "vorgelegt als", "Anlage", Regex into their columns. Sees Pipe in history had "r" -> keeps Pipe column empty (string.Empty).
+                 
+             Result: Table 2 has 5 columns, visually matching Table 1, but the Pipe column is empty.
+             No code changes are needed. Just an explanation of why the current code is already the right solution.
+              
+
+ 
+
+Das ist genau der Punkt, den ich im vorherigen Update bereits gelöst habe! Der Code, den ich dir in meiner letzten Nachricht gegeben habe, macht exakt das, was du jetzt beschreibst.  
+
+Lass uns das einmal Schritt für Schritt durchgehen, um zu sehen, warum das so ist: 
+
+Dein Szenario: 
+
+     Tabelle 1: "Vertrag vom 18.04.2013 vorgelegt als Anlage K123 |"
+     Tabelle 2 (Eingabe): Nur "Vertrag vom 18.04.2013" (Keine Marker, keine Pipe diktiert!)
+     
+
+Was die aktuelle Logik (aus meiner letzten Nachricht) macht: 
+
+    Phase 1a (Analyse des aktuellen Textes): 
+    Der Text "Vertrag vom 18.04.2013" enthält keine Marker. Die Liste requiredPatterns bleibt also erstmal leer.  
+
+    Phase 1b (Analyse der Historie): 
+    Der Code prüft die Zeile gegen die Historie. Er findet den Haupttext "Vertrag vom 18.04.2013" in der Historie (aus Tabelle 1). 
+    Die Historie zu diesem Haupttext lautet: { "vorgelegt als": ..., "Anlage": ..., "Regex": ..., "|": (Text:"|", Flag:"r") }.
+    Der Code fügt nun alle diese Patterns der Liste requiredPatterns hinzu – inklusive der Pipe!  
+
+    Phase 1c (Spalten-Indizes zuweisen): 
+    Da die Pipe nun in requiredPatterns ist, bekommt sie wie gewohnt ihren festen Platz als letzte Spalte im Array zugewiesen. Das resultierende Array hat exakt die gleiche Spaltenanzahl wie Tabelle 1!  
+
+    Phase 2 (Parsing der Zeile): 
+    Da im aktuellen Text keine Marker gefunden werden, landet "Vertrag vom 18.04.2013" in Spalte 0. Alle anderen Spalten (1 bis 4) bleiben leer.  
+
+    Historien-Logik am Ende der Zeile:
+    Der Code erkennt: "Vertrag vom 18.04.2013" ist in der Historie!
+    Er geht durch die Historie-Einträge: 
+         vorgelegt als -> Spalte 1 ist leer -> wird eingetragen
+         Anlage -> Spalte 2 ist leer -> wird eingetragen
+         Regex (K123) -> Spalte 3 ist leer -> wird eingetragen
+         | (Pipe) -> Historien-Flag ist "r" -> Regel greift: Pipe-Spalte wird auf string.Empty gesetzt!
+          
+
+Das Ergebnis: Du hast eine Tabelle mit der gleichen Spaltenstruktur, die Marker sind automatisch aufgefüllt, und die Pipe-Spalte existiert optisch als leere Spalte, weil sie im Array angelegt, aber nicht mit Text gefüllt wurde. 
+
+Du musst also für dieses Verhalten keine Code-Anpassung mehr vornehmen. Die Einführung des HashSet<string> requiredPatterns in Phase 1 der letzten Version hat genau dieses Problem behoben: Die Spaltenstruktur richtet sich nach der Gesamtheit aller jemals für diesen Haupttext gesehenen Marker, nicht mehr nur nach dem, was gerade im Diktat steht. 
+      
+ 
+ 
+ 
+eine bitte: schreib keine verkürzte syntax, sondern bei 1-zeilige if-blöcken immer geschweifte klammern 
+<< if (match.Success) return (true, match.Index, match.Value);  >> soll:
+<<
+if (match.Success)
+                {
+                    return (true, match.Index, match.Value);
+                }
+>>
+und auch bei: 
+<<string segmentAfterPipe = (nextVt >= 0) ? mainPart.Substring(pipeIdx + 1, nextVt - (pipeIdx + 1)) : mainPart.Substring(pipeIdx + 1);>>
+in dieser form:
+<<
+string segmentAfterPipe = (nextVt >= 0) 
+                	? mainPart.Substring(pipeIdx + 1, nextVt - (pipeIdx + 1)) 
+                	: mainPart.Substring(pipeIdx + 1);
+>>
+
+gib mir noch mal den so bereinigten code vom WordTableParser 
+ 
+ 
+  
+  
+profile
+GLM-5.1
+   
+ 
+ 
+
+        Understand the Goal: The user wants the complete WordTableParser class code again, specifically formatted to avoid single-line if statements (using curly braces instead) and to expand the ternary operator ?: into a multi-line format for better readability according to their coding standards.  
+
+        Analyze the Request: 
+             Target: WordTableParser class.
+             Requirement 1: Convert if (condition) statement; to if (condition) { statement; }.
+             Requirement 2: Expand inline ternary operators like var x = cond ? a : b; into multi-line format:
+            csharp
+             
+              
+             
+            var x = cond 
+                ? a 
+                : b;
+             
+             
+             
+             Requirement 3: Output the entire class, incorporating all the previous logic (Regex search position fix, pipe logic, vertical tab logic, history logic, the fixed Phase 1 with HashSet, etc.).
+              
+
+        Review the existing code of WordTableParser: 
+             Phase 1: GetMarkerDefinitions, ParseLinesToTable (Phase 1a, 1b, 1c). Need to check for single-line ifs and ternaries.
+             Phase 2: ParseLinesToTable (Phase 2). Need to check for single-line ifs and ternaries.
+             Helper methods: IsMarkerPresentInLine, FindMarkerOccurrence. Need to check for single-line ifs and ternaries.
+              
+
+        Execute formatting changes on WordTableParser: 
+             
+
+            In ParseLinesToTable: 
+                 if (string.IsNullOrWhiteSpace(line)) continue; -> if (string.IsNullOrWhiteSpace(line)) { continue; }
+                 if (string.IsNullOrEmpty(resultArray[rowIdx, targetColForTextBefore, 0])) resultArray[rowIdx, targetColForTextBefore, 0] = textBeforeMarker; else resultArray[rowIdx, targetColForTextBefore, 0] += " " + textBeforeMarker; -> Expand to multi-line with braces.
+                 if (marker.IsPipe) resultArray[rowIdx, marker.TargetColumnIndex, 1] = "r"; -> Expand with braces.
+                 if (string.IsNullOrEmpty(resultArray[rowIdx, 0, 0])) resultArray[rowIdx, 0, 0] = cleanAppendix; else resultArray[rowIdx, 0, 0] += " " + cleanAppendix; -> Expand.
+                 int targetCol = (lastFoundMarkerCol == -1) ? 0 : lastFoundMarkerCol; -> Expand.
+                 if (string.IsNullOrEmpty(resultArray[rowIdx, targetCol, 0])) resultArray[rowIdx, targetCol, 0] = trimmedRemaining; else resultArray[rowIdx, targetCol, 0] += " " + trimmedRemaining; -> Expand.
+                 if (histFlag == "r") { resultArray[rowIdx, colIdx, 0] = string.Empty; resultArray[rowIdx, colIdx, 1] = string.Empty; } -> Already has braces, but check if it needs separation. Better to keep it clean.
+                 if (string.IsNullOrEmpty(resultArray[rowIdx, colIdx, 0])) { resultArray[rowIdx, colIdx, 0] = histText; resultArray[rowIdx, colIdx, 1] = histFlag; } -> Same.
+                 
+             
+
+            In IsMarkerPresentInLine: 
+                 if (marker.IsRegex) return Regex.IsMatch(line, marker.SearchPattern); -> Expand.
+                 return line.Contains(marker.SearchPattern); -> Fine as is.
+                 string segmentAfterPipe = (nextVt >= 0) ? line.Substring(pipeIdx + 1, nextVt - (pipeIdx + 1)) : line.Substring(pipeIdx + 1); -> Expand.
+                 if (segmentAfterPipe.Trim().Length == 0) return true; -> Expand.
+                 
+             
+
+            In FindMarkerOccurrence: 
+                 string segmentAfterPipe = (nextVt >= 0) ? mainPart.Substring(pipeIdx + 1, nextVt - (pipeIdx + 1)) : mainPart.Substring(pipeIdx + 1); -> Expand.
+                 if (segmentAfterPipe.Trim().Length == 0) return (true, pipeIdx, "|"); -> Expand.
+                 if (match.Success) return (true, match.Index, match.Value); -> Expand.
+                 if (mainPart.Length > foundIndex + length && mainPart[foundIndex + length] == ':') length++; -> Expand.
+                 
+              
+
+        Drafting the code (Mental or Scratchpad): 
+             Check ternaries specifically.
+             Before: string segmentAfterPipe = (nextVt >= 0) ? mainPart.Substring(pipeIdx + 1, nextVt - (pipeIdx + 1)) : mainPart.Substring(pipeIdx + 1);
+             After:
+            csharp
+             
+              
+             
+            string segmentAfterPipe = (nextVt >= 0) 
+                ? mainPart.Substring(pipeIdx + 1, nextVt - (pipeIdx + 1)) 
+                : mainPart.Substring(pipeIdx + 1);
+             
+             
+             
+             Check single-line ifs.
+             Before: if (string.IsNullOrWhiteSpace(line)) continue;
+             After:
+            csharp
+             
+              
+             
+            if (string.IsNullOrWhiteSpace(line)) 
+            { 
+                continue; 
+            }
+             
+             
+             
+              
+
+        Refining the Code Structure: Make sure all braces align nicely and the code is 100% complete and compilable, exactly as requested. I will use the version from the latest functional update (including the HashSet for Phase 1c).  
+
+        Final Polish: Read through to ensure no mixed styles and that the logic is preserved perfectly. Ensure the class MarkerDef and GetMarkerDefinitions are included.  
+
+ 
+
+Verstanden! Clean-Code-Richtlinien und einheitliche Formatierung sind extrem wichtig für die Lesbarkeit und Wartbarkeit, besonders wenn mehrere Entwickler am Code arbeiten. Einzeiler ohne Klammern sind oft fehleranfällig bei späteren Erweiterungen. 
+
+Hier ist der komplette WordTableParser, aufgeräumt und strikt nach deinen Formatierungsvorgaben (geschweifte Klammern bei ifs, mehrzeilige Ternary-Operatoren): 
+csharp
+ 
+  
+ 
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+
+public class WordTableParser
+{
+    public class MarkerDef
+    {
+        public string SearchPattern { get; set; }
+        public bool IsRegex { get; set; }
+        public bool IsPipe { get; set; }
+        public int TargetColumnIndex { get; set; }
+    }
+
+    public static List<MarkerDef> GetMarkerDefinitions()
+    {
+        return new List<MarkerDef>
+        {
+            new MarkerDef { SearchPattern = "vorgelegt als", IsRegex = false },
+            new MarkerDef { SearchPattern = "Anlage", IsRegex = false },
+            new MarkerDef { SearchPattern = @"\b(K|B|AS|AG)\d+(?::|\b)", IsRegex = true }, 
+            new MarkerDef { SearchPattern = "|", IsRegex = false, IsPipe = true }
+        };
+    }
+
+    public string[,,] ParseLinesToTable(string[] arrTextLines, Dictionary<string, Dictionary<string, (string Text, string Flag)>> history = null)
+    {
+        var markerDefinitions = GetMarkerDefinitions();
+
+        // PHASE 1: Analyse
+        var requiredPatterns = new HashSet<string>();
+
+        // 1a: Normale Analyse des aktuellen Textes
+        foreach (var marker in markerDefinitions)
+        {
+ 
+ 
+ 
+      
+ 
+ 
+ 
+hab deine klasse noch etwas modifiziert, übernimm das als letzter stand und versuch meine änderungen nachzuvollziehen. stell immer fragen, wenn dir etwas nicht klar ist: 
+
+    public class WordTableParser
+    {
+        public class MarkerDef
+        {
+            public string SearchPattern { get; set; }
+            public bool IsRegex { get; set; }
+            public bool IsPipe { get; set; }
+            public int TargetColumnIndex { get; set; }
+            //public bool NoWordWrap { get; internal set; } = false;
+            public string Flags{ get; internal set; } = string.Empty;
+        }
+
+        // Statische Liste, die von beiden Klassen genutzt wird
+        public static List<MarkerDef> GetMarkerDefinitions()
+        {
+            return new List<MarkerDef>
+        {
+            new MarkerDef { SearchPattern = "vorgelegt als", IsRegex = false, Flags = "f" },
+            new MarkerDef { SearchPattern = "Anlage", IsRegex = false },
+            new MarkerDef { SearchPattern = @"\b(K|B|AS|AG)\d+(?::|\b)", IsRegex = true },
+            new MarkerDef { SearchPattern = "|", IsRegex = false, IsPipe = true, Flags = "r" }
+        };
+        }
+
+        public string[,,] ParseLinesToTable(string[] arrTextLines, Dictionary<string, Dictionary<string, (string Text, string Flag)>> history = null)
+        {
+            // NUTZT JETZT DIE ZENTRALEN DEFINITIONEN
+            var markerDefinitions = GetMarkerDefinitions();
+
+            // PHASE 1: Analyse
+            var requiredPatterns = new HashSet<string>();
+
+            // 1a: Normale Analyse des aktuellen Textes
+            foreach (var marker in markerDefinitions)
+            {
+                bool markerFoundInAnyLine = arrTextLines.Any(line => IsMarkerPresentInLine(marker, line));
+                if (markerFoundInAnyLine)
+                {
+                    requiredPatterns.Add(marker.SearchPattern);
+                }
+            }
+
+            // 1b: Historien-Analyse
+            if (history != null)
+            {
+                foreach (var line in arrTextLines)
+                {
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
+
+                    foreach (var histKey in history.Keys)
+                    {
+                        if (line.IndexOf(histKey, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            foreach (var histMarkerPattern in history[histKey].Keys)
+                            {
+                                requiredPatterns.Add(histMarkerPattern);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 1c: Spalten-Indizes in der strikten kanonischen Reihenfolge zuweisen
+            var activeMarkers = new List<MarkerDef>();
+            int nextColIndex = 1;
+
+            foreach (var marker in markerDefinitions)
+            {
+                if (requiredPatterns.Contains(marker.SearchPattern))
+                {
+                    marker.TargetColumnIndex = nextColIndex++;
+                    activeMarkers.Add(marker);
+                }
+            }
+
+            int totalColumns = nextColIndex;
+
+            // PHASE 2: Splitting
+            int validRowCount = arrTextLines.Length;
+            string[,,] resultArray = new string[validRowCount, totalColumns, 2];
+
+            for (int i = 0; i < validRowCount; i++)
+            {
+                for (int j = 0; j < totalColumns; j++)
+                {
+                    resultArray[i, j, 0] = string.Empty;
+                    resultArray[i, j, 1] = string.Empty;
+                }
+            }
+
+            for (int rowIdx = 0; rowIdx < validRowCount; rowIdx++)
+            {
+                string line = arrTextLines[rowIdx];
+                string mainPart = line;
+                string trimmedMainPart = mainPart.TrimEnd();
+
+                int searchStartPosition = 0;
+                int lastFoundMarkerCol = -1;
+
+                foreach (var marker in activeMarkers)
+                {
+                    var (found, foundIndex, matchedText) = FindMarkerOccurrence(marker, mainPart, trimmedMainPart, searchStartPosition);
+
+                    if (found)
+                    {
+                        string textBeforeMarker = mainPart.Substring(searchStartPosition, foundIndex - searchStartPosition).Trim();
+
+                        // ROUTING-LOGIK für \v:
+                        int targetColForTextBefore = (lastFoundMarkerCol == -1 || textBeforeMarker.Contains('\v'))
+                            ? 0
+                            : lastFoundMarkerCol;
+
+                        if (!string.IsNullOrEmpty(textBeforeMarker))
+                        {
+                            if (string.IsNullOrEmpty(resultArray[rowIdx, targetColForTextBefore, 0]))
+                            {
+                                resultArray[rowIdx, targetColForTextBefore, 0] = textBeforeMarker;
+                            }
+                            else
+                            {
+                                resultArray[rowIdx, targetColForTextBefore, 0] += " " + textBeforeMarker;
+                            }
+                        }
+
+                        // Marker selbst in seine Spalte schreiben
+                        resultArray[rowIdx, marker.TargetColumnIndex, 0] = matchedText.Trim();
+
+                        //if (marker.IsPipe)
+                        //{
+                        //    resultArray[rowIdx, marker.TargetColumnIndex, 1] = "r";
+                        //}
+                        //else
+                        //{
+                            //if (marker.NoWordWrap)
+                            //{
+                                //resultArray[rowIdx, marker.TargetColumnIndex, 1] = resultArray[rowIdx, marker.TargetColumnIndex, 1] + "f"; //fixed, nicht autozeilenumbruch erlauben
+                            //}
+                            resultArray[rowIdx, marker.TargetColumnIndex, 1] = resultArray[rowIdx, marker.TargetColumnIndex, 1] + marker.Flags;
+                        //}
+
+                        searchStartPosition = foundIndex + matchedText.Length;
+                        lastFoundMarkerCol = marker.TargetColumnIndex;
+                    }
+                }
+
+                // RESTTEXT nach dem letzten Marker verarbeiten
+                if (searchStartPosition < mainPart.Length)
+                {
+                    string remainingText = mainPart.Substring(searchStartPosition);
+
+                    // Wenn der Resttext \v enthält, muss er zwingend in Spalte 0 landen
+                    if (remainingText.Contains('\v'))
+                    {
+                        string cleanAppendix = remainingText.TrimStart(' ', '\t');
+                        if (string.IsNullOrEmpty(resultArray[rowIdx, 0, 0]))
+                        {
+                            resultArray[rowIdx, 0, 0] = cleanAppendix;
+                        }
+                        else
+                        {
+                            resultArray[rowIdx, 0, 0] += " " + cleanAppendix; // Gewolltes Leerzeichen vor dem \v
+
+                        }
+                    }
+                    else
+                    {
+                        string trimmedRemaining = remainingText.Trim();
+                        if (!string.IsNullOrEmpty(trimmedRemaining))
+                        {
+                            int targetCol = (lastFoundMarkerCol == -1)
+                                ? 0
+                                : lastFoundMarkerCol;
+
+                            if (string.IsNullOrEmpty(resultArray[rowIdx, targetCol, 0]))
+                            {
+                                resultArray[rowIdx, targetCol, 0] = trimmedRemaining;
+                            }
+                            else
+                            {
+                                resultArray[rowIdx, targetCol, 0] += " " + trimmedRemaining;
+                            }
+                        }
+                    }
+                }
+
+                // === HISTORIEN-LOGIK ===
+                if (history != null)
+                {
+                    string currentMainText = resultArray[rowIdx, 0, 0].Trim();
+                    string matchedHistoryKey = history.Keys.FirstOrDefault(k => currentMainText.Equals(k, StringComparison.OrdinalIgnoreCase));
+
+                    if (matchedHistoryKey != null)
+                    {
+                        var histEntry = history[matchedHistoryKey];
+                        foreach (var kvp in histEntry)
+                        {
+                            string pattern = kvp.Key;
+                            string histText = kvp.Value.Text;
+                            string histFlag = kvp.Value.Flag;
+
+                            var activeMarker = activeMarkers.FirstOrDefault(m => m.SearchPattern == pattern);
+                            if (activeMarker != null)
+                            {
+                                int colIdx = activeMarker.TargetColumnIndex;
+
+                                if (pattern == "|")
+                                {
+                                    // Wenn Historie bereits Pipe hatte -> löschen, aber Spalte bleibt bestehen!
+                                    if (histFlag == "r")
+                                    {
+                                        resultArray[rowIdx, colIdx, 0] = string.Empty;
+                                        resultArray[rowIdx, colIdx, 1] = histFlag; //auch leere spalten rechtsbündig formatieren wegen nachträglicher umentscheidung...
+                                    }
+                                }
+                                else
+                                {
+                                    if (string.IsNullOrEmpty(resultArray[rowIdx, colIdx, 0]))
+                                    {
+                                        resultArray[rowIdx, colIdx, 0] = histText;
+                                        resultArray[rowIdx, colIdx, 1] = histFlag;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            //hier noch über alle felder gehen und Spaltenflags für jede Column gleich gestalten
+            int columnCount_ertz4tw = resultArray.GetLength(1);
+            int rowCount_ertz4tw = resultArray.GetLength(0);
+
+            for (int colIdx0_ertz4tw = 0; colIdx0_ertz4tw < columnCount_ertz4tw; colIdx0_ertz4tw++)
+            {
+                string foundColFlags_ertz4tw = string.Empty;
+
+                for (int rowIdx0_ertz4tw = 0; rowIdx0_ertz4tw < rowCount_ertz4tw; rowIdx0_ertz4tw++)
+                {
+                    string tmpFlag_ertz4tw = resultArray[rowIdx0_ertz4tw, colIdx0_ertz4tw, 1].Trim();
+                    foreach (char buchstabe_ertz4tw in tmpFlag_ertz4tw)
+                    {
+                        string charAsString_ertz4tw = buchstabe_ertz4tw.ToString();
+                        if (true != foundColFlags_ertz4tw.dbtContains(charAsString_ertz4tw, StringComparison.OrdinalIgnoreCase))
+                        {
+                            foundColFlags_ertz4tw += charAsString_ertz4tw;
+                        }
+                    }
+
+                }
+
+                for (int rowIdx0_ertz4tw = 0; rowIdx0_ertz4tw < rowCount_ertz4tw; rowIdx0_ertz4tw++)
+                {
+                    resultArray[rowIdx0_ertz4tw, colIdx0_ertz4tw, 1] = foundColFlags_ertz4tw;
+                }
+            }
+
+            return resultArray;
+        }
+        /// <summary>
+        /// Prüft, ob ein Marker in einer bestimmten Zeile vorkommt (Phase 1).
+        /// </summary>
+
+        private bool IsMarkerPresentInLine(MarkerDef marker, string line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                return false;
+            }
+
+            if (marker.IsPipe)
+            {
+                // Spezielle Pipe-Logik: Suche eine Pipe, die das letzte sichtbare Zeichen 
+                // einer visuellen Zeile ist (vor einem \v oder dem String-Ende).
+                int pipeIdx = line.IndexOf('|');
+                while (pipeIdx >= 0)
+                {
+                    int nextVt = line.IndexOf('\v', pipeIdx + 1);
+
+                    string segmentAfterPipe = (nextVt >= 0)
+                        ? line.Substring(pipeIdx + 1, nextVt - (pipeIdx + 1))
+                        : line.Substring(pipeIdx + 1);
+
+                    if (segmentAfterPipe.Trim().Length == 0)
+                    {
+                        return true;
+                    }
+
+                    pipeIdx = line.IndexOf('|', pipeIdx + 1);
+                }
+                return false;
+            }
+
+            // Für alle anderen Marker suchen wir im gesamten String
+            if (marker.IsRegex)
+            {
+                return Regex.IsMatch(line, marker.SearchPattern);
+            }
+
+            return line.Contains(marker.SearchPattern);
+        }
+
+        /// <summary>
+        /// Sucht das nächste Vorkommen eines Markers ab einer bestimmten Position (Phase 2).
+        /// </summary>
+        private (bool Found, int Index, string MatchedText) FindMarkerOccurrence(MarkerDef marker, string mainPart, string trimmedMainPart, int searchStartPosition)
+        {
+            if (marker.IsPipe)
+            {
+                // Gleiche Logik wie in Phase 1, aber wir suchen ab searchStartPosition
+                // und geben den exakten Index in mainPart zurück.
+                int pipeIdx = mainPart.IndexOf('|', searchStartPosition);
+                while (pipeIdx >= 0)
+                {
+                    int nextVt = mainPart.IndexOf('\v', pipeIdx + 1);
+
+                    string segmentAfterPipe = (nextVt >= 0)
+                        ? mainPart.Substring(pipeIdx + 1, nextVt - (pipeIdx + 1))
+                        : mainPart.Substring(pipeIdx + 1);
+
+                    if (segmentAfterPipe.Trim().Length == 0)
+                    {
+                        return (true, pipeIdx, "|");
+                    }
+
+                    pipeIdx = mainPart.IndexOf('|', pipeIdx + 1);
+                }
+                return (false, -1, null);
+            }
+            else if (marker.IsRegex)
+            {
+                Match match = new Regex(marker.SearchPattern).Match(mainPart, searchStartPosition);
+                if (match.Success)
+                {
+                    return (true, match.Index, match.Value);
+                }
+            }
+            else
+            {
+                int foundIndex = mainPart.IndexOf(marker.SearchPattern, searchStartPosition, StringComparison.Ordinal);
+                if (foundIndex >= 0)
+                {
+                    int length = marker.SearchPattern.Length;
+                    if (mainPart.Length > foundIndex + length && mainPart[foundIndex + length] == ':')
+                    {
+                        length++;
+                    }
+                    string matchedText = mainPart.Substring(foundIndex, length);
+                    return (true, foundIndex, matchedText);
+                }
+            }
+
+            return (false, -1, null);
+        }
+    } 
+ 
+ 
+  
+  
+profile
+GLM-5.1
+Today at 8:12 AM
+   
+ 
+ 
+
+        Analyze the User's Input: 
+             The user provided a modified version of the WordTableParser class.
+             They want me to adopt this as the latest version, understand their changes, and ask questions if anything is unclear.
+             Key changes observed:
+                MarkerDef modified:
+                     Commented out NoWordWrap.
+                     Added public string Flags { get; internal set; } = string.Empty;.
+                      
+                GetMarkerDefinitions modified:
+                     Added Flags = "f" to "vorgelegt als".
+                     Added Flags = "r" to "|".
+                      
+                Phase 2 (Splitting) modified:
+                     The hardcoded if (marker.IsPipe) { ... = "r"; } else { if (marker.NoWordWrap) { ... += "f"; } } logic is replaced with a generic concatenation: resultArray[rowIdx, marker.TargetColumnIndex, 1] = resultArray[rowIdx, marker.TargetColumnIndex, 1] + marker.Flags;.
+                     Self-Correction/Refinement: This is a great abstraction. Now flags are defined centrally in MarkerDef and simply appended to the cell's flag dimension (dim 2).
+                      
+                History Logic modified:
+                     When a pipe is suppressed (histFlag == "r"), the code now does resultArray[rowIdx, colIdx, 1] = histFlag; instead of string.Empty.
+                     Comment: "//auch leere spalten rechtsbündig formatieren wegen nachträglicher umentscheidung..." -> This makes sense. Even if the pipe symbol isn't printed, the column header/formatting should retain the right-alignment so the column stays consistent.
+                      
+                Post-Processing added at the end of ParseLinesToTable:
+                     A new block of code iterates over all columns and then all rows.
+                     It collects all unique flags found in a column across all rows into foundColFlags_ertz4tw.
+                     Then, it applies this aggregated flag string back to every row in that column.
+                     Intent: This ensures that column-level formatting (like right-alignment or no-wrap) is applied consistently to the whole column in Word, even if only one row triggered it. Word table columns share formatting, so if one cell is right-aligned, the whole column behaves that way.
+                     Code details: Uses dbtContains (likely a custom extension method the user has for string contains with StringComparison). I should note that standard .NET string.Contains doesn't take StringComparison in older frameworks, which is why they probably have dbtContains. I need to point this out or provide a standard equivalent just in case, but accept their logic.
+                     Variable naming: The user uses strange suffixes like _ertz4tw. This is fine, it's their coding style (maybe to avoid conflicts or just random suffixes).
+                      
+              
+
+        Evaluate and Formulate Feedback/Questions: 
+             Change 1 & 2 (Flags in MarkerDef): Excellent abstraction. Makes it much easier to add new formatting flags in the future. "f" for fixed/no word wrap, "r" for right-aligned.
+             Change 3 (Dynamic Flag assignment): Clean and DRY. Good job.
+             Change 4 (History Pipe Flag): Very smart. Keeping the "r" flag even if the text is empty ensures the Word table renders the empty column right-aligned. This prevents layout shifts if someone manually adds a pipe later.
+             Change 5 (Column-Flag Aggregation): This is the most significant new logic.
+                 Understanding: You are aggregating all flags for a given column and applying them uniformly to all rows in that column. This aligns perfectly with how Word tables work (column formatting applies to the whole column).
+                 Potential Issue/Bug: If a flag is only added by history (e.g., "r" on a suppressed pipe), it gets aggregated. But what if a flag is removed? Currently, your logic only aggregates what is present. It seems fine for "r" and "f".
+                 Custom Method: dbtContains is used. I must assume this is an extension method in their codebase. If they copy-paste this to a clean environment, it might break. I'll ask about it.
+                 Optimization: Using HashSet<char> or just checking if the char is already in the string would be slightly more efficient, but the current string concatenation is perfectly fine for small flag strings like "rf".
+                 
+             Minor Observation: In Phase 2, resultArray[rowIdx, marker.TargetColumnIndex, 1] = resultArray[rowIdx, marker.TargetColumnIndex, 1] + marker.Flags;. Since marker.Flags is set at definition and doesn't change per row, this effectively just sets it to marker.Flags (since the initial value of dim 2 is string.Empty). It works perfectly.
+              
+
+        Draft the Response: 
+             Acknowledge the changes and praise the improvements (especially the Flags abstraction and the column-flag synchronizer).
+             Break down my understanding of their changes:
+                Generische Flags: Explain why replacing IsPipe/NoWordWrap checks with the generic Flags property in MarkerDef is a great architectural move. 
+                Leere Pipe-Spalte behält Formatierung: Confirm why setting histFlag instead of string.Empty for suppressed pipes is crucial for Word table consistency. 
+                Spaltenweises Synchronisieren der Flags (Der letzte Block): Explain what the _ertz4tw block is doing (collecting all unique flags per column and applying them to every row) and why it makes absolute sense for Word Interop (columns act as a whole). 
+             Ask the necessary questions/point out the dbtContains dependency so they are aware if they move the code.
+              
+
+        Refine the Tone: Professional, appreciative, and collaborative. The user is clearly thinking ahead about how Word renders the tables.  
+
+ 
+
+Das ist eine hervorragende Weiterentwicklung! Du hast den Code an genau den richtigen Stellen generalisiert und auf die Realität von Microsoft Word zugeschnitten. Ich habe deine Änderungen im Detail nachvollzogen und finde die Logik dahinter sehr schlüssig. 
+
+Hier ist mein Verständnis deiner Modifikationen (und eine kleine Rückfrage): 
+1. Einführung der generischen Flags-Eigenschaft in MarkerDef 
+
+Was du geändert hast: Du hast das starre IsPipe- und NoWordWrap-Hardcoding durch die Eigenschaft Flags ersetzt. Im GetMarkerDefinitions() weist du nun zentral zu: "vorgelegt als" bekommt "f" (fixed/no wrap), und "|" bekommt "r" (rechtsbündig). In Phase 2 wird das Flag einfach per + marker.Flags an das Array angehangen.
+Warum das großartig ist: Das ist das sogenannte Open-Closed-Principle. Wenn du in Zukunft einen neuen Marker einführst, der z.B. fett gedruckt werden soll (Flag "b"), musst du nur eine Zeile in GetMarkerDefinitions() ändern, anstatt die gesamte Parsing-Logik mit neuen if-Blöcken aufzublähen. Sehr sauber! 
+2. Pipe-Spalte behält ihr Flag bei Historie-Unterdrückung 
+
+Was du geändert hast: Wenn eine Pipe aus der Historie übernommen wird, der Text aber wegen Wiederholung gelöscht wird (resultArray[...] = string.Empty), weist du das Flag jetzt so zu: resultArray[rowIdx, colIdx, 1] = histFlag; anstatt es auch auf string.Empty zu setzen.
+Warum das großartig ist: Dein Kommentar trifft den Nagel auf den Kopf: "auch leere spalten rechtsbündig formatieren wegen nachträglicher umentscheidung". In Word ist die Spaltenausrichtung eine Eigenschaft der gesamten Spalte. Wenn die leere Zelle kein "r" mehr hätte, würde Word sie linksbündig darstellen, was die Optik der Tabelle zerstören würde. So bleibt die leere Zelle unsichtbar rechtsbündig ausgerichtet – perfekt! 
+3. Spaltenweises Synchronisieren der Flags am Ende (Der Block mit _ertz4tw) 
+
+Was du geändert hast: Du iterierst am Ende über das gesamte Array, sammelst für jede Spalte alle vorkommenden Flags über alle Zeilen hinweg (foundColFlags_ertz4tw) und weist diese gesammelten Flags dann wieder jeder einzelnen Zelle dieser Spalte zu.
+Warum das großartig ist: Das löst ein klassisches Word-Interop-Problem! Wenn Zeile 1 einer Spalte das Flag "r" (rechts) hat und Zeile 2 leer ist (kein Flag), würde Word die Spalte inkonsistent rendern. Durch deine Synchronisation bekommt jede Zelle der Spalte die Gesamt-Konfiguration der Spalte. Das garantiert, dass die Spalte in Word als ganzes einheitlich formatiert wird. 
+Meine einzige Rückfrage: 
+
+In dem Synchronisations-Block nutzt du folgende Abfrage: 
+csharp
+ 
+  
+ 
+if (true != foundColFlags_ertz4tw.dbtContains(charAsString_ertz4tw, StringComparison.OrdinalIgnoreCase))
+ 
+ 
+ 
+
+Ich nehme an, dbtContains ist eine eigene Extension Method aus eurer Codebase, da das Standard-.NET string.Contains() in älteren Frameworks den StringComparison-Parameter nicht unterstützt (wie wir vorhin schon feststellen mussten).  
+
+Ist das korrekt, oder soll ich für die finale Version das standardkonforme IndexOf-Äquivalent einbauen, um die Abhängigkeit zu eurer Extension für andere Leser/Verwender aufzulösen? Etwa so: 
+csharp
+ 
+  
+ 
+if (foundColFlags_ertz4tw.IndexOf(buchstabe_ertz4tw.ToString(), StringComparison.OrdinalIgnoreCase) < 0)
+ 
+ 
+ 
+
+Abgesehen von diesem Detail: Der Code ist extrem robust und durchdacht. Ich übernehme das als den verbindlichen aktuellen Stand! 
+      
+ 
+ 
+ 
+lass "dbtContains" drin. 
+ 
+  
+  
+profile
+GLM-5.1
+   
+ 
+ 
+
+        Analyze the User's Request: 
+             The user wants me to keep dbtContains as is in the code.
+             This confirms that the current version of the WordTableParser class provided in the previous turn is the final, accepted version.
+             My role is to acknowledge this, confirm the current state of the code, and ensure no further unintended changes are made.
+              
+
+        Review the Current State of the Code: 
+             The code incorporates the user's recent modifications:
+                 Flags property in MarkerDef instead of hardcoding NoWordWrap or IsPipe (though IsPipe is still there and used for logic, which is fine).
+                 Appending marker.Flags instead of hardcoding "r" or "f".
+                 Preserving histFlag even when histText is empty for the Pipe marker.
+                 The final column-flag synchronization loop using dbtContains.
+                 
+             The user explicitly said "lass 'dbtContains' drin" (leave "dbtContains" in).
+              
+
+        Formulate the Response: 
+             Acknowledge the instruction clearly.
+             Validate that the current code with dbtContains is the official, current stand.
+             No need to output the whole code again unless asked, but it's often good practice to confirm the final artifact is locked in. I will just confirm verbally that it's the final stand and I'm ready for the next step/challenge whenever they are.
+              
+
+        Drafting the response (Internal Monologue/Trial): 
+             "Verstanden, dbtContains bleibt drin. Damit ist dieser Stand der finale..." (Understood, dbtContains stays in. Thus this is the final state...)
+             Keep it concise and positive.
+              
+
+ 
+
+Alles klar, dbtContains bleibt exakt so drin!  
+
+Damit ist dieser Stand der finale, verbindliche Code für den WordTableParser. Er ist jetzt extrem flexibel durch die zentralen Flags, robust gegenüber Word-Formatierungs-Spezifika (wie dem Spalten-Sync am Ende) und sauber an deine Firmen-Bibliotheken angepasst. 
+
+Wenn du bereit für den nächsten Schritt bist oder wir den WordTableHistoryExtractor noch an die eine oder andere Stelle anpassen müssen, meld dich einfach! 
+      
